@@ -26,6 +26,9 @@ import { buildCommandList } from '../commands/index.ts';
 import { attachmentProcessor } from '../middleware/attachment.ts';
 import { questionAnswer } from '../middleware/question-answer.ts';
 import { getHistoryStore, historyGroupKey } from '../features/history-store.ts';
+import { resolveAccessPolicy } from './access-policy.ts';
+
+export { resolveAccessPolicy, type ResolvedAccessPolicy } from './access-policy.ts';
 
 export function setupMiddlewares(
   bot: QQBot,
@@ -41,14 +44,8 @@ export function setupMiddlewares(
 
   // 3. 访问控制（白名单/开放/禁用）
   bot.use(accessPolicy({
-    c2c: {
-      mode: config.access.c2cMode,
-      allow: config.access.c2cAllow.length > 0 ? config.access.c2cAllow : ['*'],
-    },
-    group: {
-      mode: config.access.groupMode,
-      allow: config.access.groupAllow.length > 0 ? config.access.groupAllow : ['*'],
-    },
+    c2c: resolveAccessPolicy(config.access.c2cMode, config.access.c2cAllow, 'c2c', logger),
+    group: resolveAccessPolicy(config.access.groupMode, config.access.groupAllow, 'group', logger),
     onBlock: (_mCtx, reason) => {
       if (config.debug) {
         logger.debug(`Access blocked: ${reason}`);
