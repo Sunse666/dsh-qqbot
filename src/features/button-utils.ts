@@ -56,3 +56,27 @@ export function decodeButtonData(raw: string): ButtonData | undefined {
 
 /** 构建内联键盘的行数组（供 buildKeyboard/buildApprovalKeyboard 复用类型） */
 export type KeyboardRows = InlineKeyboard['content']['rows'];
+
+// ── 交互事件的点击者身份 ──
+
+/**
+ * 从交互事件里取「点击者」openid。
+ *
+ * QQ 在不同场景下用不同的 openid 空间标识同一个人：
+ *   - 群消息的 senderId 是 `author.member_openid`（群成员 openid），
+ *     群互动的点击者字段是 `group_member_openid`（同一空间）；
+ *   - 私聊两侧都用 `user_openid`。
+ * 因此群聊必须优先取 `group_member_openid`，否则会拿 `user_openid` 去和
+ * `member_openid` 比较——两个空间的值永不相等，审批会全部失效。
+ *
+ * 事件可能只携带其中一个字段，故两个都作为候选返回，由调用方判定匹配。
+ */
+export function interactionClickerIds(event: {
+  user_openid?: string;
+  group_member_openid?: string;
+}): string[] {
+  const ids = [event.group_member_openid, event.user_openid].filter(
+    (id): id is string => typeof id === 'string' && id.length > 0,
+  );
+  return [...new Set(ids)];
+}

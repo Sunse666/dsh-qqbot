@@ -10,7 +10,7 @@
 import type { EventOptions } from '@deepseek-ai/cordis';
 import type { InteractionEvent } from '@tencent-connect/qqbot-nodejs';
 import type { ChatScope, Logger, ReplyTarget } from '../types.ts';
-import { decodeButtonData } from './button-utils.ts';
+import { decodeButtonData, interactionClickerIds } from './button-utils.ts';
 import { buildApprovalKeyboard, buildApprovalText } from './approval-renderer.ts';
 
 // ── 最小契约（对齐 dsh-user-approval，避免硬依赖） ──
@@ -47,6 +47,8 @@ export interface ApprovalSessionRecordLike {
   sessionKey: string;
   scope: ChatScope;
   replyTarget: ReplyTarget;
+  /** 发起当前指令的用户 openid：审批决策只能由他做出 */
+  senderId: string;
 }
 
 export interface ApprovalChannelManagerLike {
@@ -72,6 +74,8 @@ export interface ApprovalChannelContext {
 interface PendingApproval {
   record: ApprovalSessionRecordLike;
   request: ApprovalRequest;
+  /** 谁发起的这条指令（= park 时该会话记录上的 senderId） */
+  requesterId: string;
   resolve: (outcome: ApprovalOutcome) => void;
   onAbort?: () => void;
 }
@@ -171,6 +175,18 @@ export class ApprovalChannel {
     const button = decodeButtonData(data);
     if (!button || button.t !== 'approval') return false;
 
+    // 群聊里任何成员都能点按钮：不校验发起人，等于把审批权交给
+    // 同一个（可能不可信的）群成员，审批门形同虚设。非发起人只提示、不结算。
+    const clickers = interactionClickerIds(event);
+    if (clickers.length > 0 && !clickers.includes(entry.requesterId)) {
+      this.notifyNotRequester(entry);
+      return true;
+    }
+    if (clickers.length === 0) {
+      // 事件没带点击者标识（只会出现在极端裁剪的载荷里）：无法校验，保持原有行为并留痕
+      this.logger.warn(`im-qqbot: interaction without clicker openid, requester check skipped key=${entry.record.sessionKey}`);
+    }
+
     this.pending.delete(record.sessionKey);
     this.removeAbort(entry);
     entry.resolve(button.d === 'allow' ? 'allowed-once' : 'rejected');
@@ -197,7 +213,7 @@ export class ApprovalChannel {
     }
 
     return new Promise<ApprovalOutcome>((resolve) => {
-      const entry: PendingApproval = { record, request, resolve };
+      const entry: PendingApproval = { record, request, requesterId: record.senderId, resolve };
       if (request.signal) {
         const onAbort = (): void => {
           if (this.pending.get(key) !== entry) return;
@@ -210,6 +226,16 @@ export class ApprovalChannel {
       this.pending.set(key, entry);
       this.logger.info(`im-qqbot: approval sent to QQ, waiting for decision key=${key}`);
     });
+  }
+
+  /** 非发起人点击：提示但不结算，审批仍挂起等待发起人 */
+  private notifyNotRequester(entry: PendingApproval): void {
+    const text = `⚠️ 这次 \`${entry.request.toolName}\` 操作由他人发起，只有发起人可以确认。`;
+    void this.sender.sendMarkdown(entry.record.replyTarget, text).catch((err: unknown) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.logger.warn(`im-qqbot: notify not-requester failed key=${entry.record.sessionKey}: ${msg}`);
+    });
+    this.logger.info(`im-qqbot: approval click rejected (not requester) key=${entry.record.sessionKey}`);
   }
 
   private removeAbort(entry: PendingApproval): void {

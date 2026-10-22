@@ -131,6 +131,7 @@ export interface SessionRecord {
   replyTarget: ReplyTarget;
   scope: ChatScope;
   peerId: string;
+  /** 最近一次投递消息的发送者（群聊共用记录，审批/问答据此校验决策人） */
   senderId: string;
   lastActivity: number;
   agentPreset?: string;
