@@ -30,8 +30,13 @@ function createSender(sent: SentMessage[]) {
 
 const sessionKey = (scope: ChatScope, peerId: string): string => `qqbot:app:${scope}:${peerId}`;
 
-function makeRecord(key: string, scope: ChatScope = 'c2c'): ApprovalSessionRecordLike {
-  return { sessionKey: key, scope, replyTarget: { scope, targetId: 'x', msgId: 'm' } };
+function makeRecord(key: string, scope: ChatScope = 'c2c', senderId?: string): ApprovalSessionRecordLike {
+  return {
+    sessionKey: key,
+    scope,
+    replyTarget: { scope, targetId: 'x', msgId: 'm' },
+    senderId: senderId ?? (key.split(':').pop() ?? 'peer-qq'),
+  };
 }
 
 function createManager(opts?: {
@@ -220,6 +225,38 @@ describe('ApprovalChannel.handleInteraction', () => {
     // 拒绝 → rejected
     expect(ch.handleInteraction(makeEvent(JSON.stringify({ t: 'approval', d: 'deny' }), { user: 'peer-qq' }))).toBe(true);
     await expect(p).resolves.toBe('rejected');
+  });
+});
+
+describe('ApprovalChannel.handleInteraction 发起人校验', () => {
+  it('ignores a group member who is not the requester and keeps it pending', async () => {
+    const sent: SentMessage[] = [];
+    const record = makeRecord(sessionKey('group', 'G1'), 'group', 'owner');
+    const ch = new ApprovalChannel(
+      createManager({ findBySessionId: (id) => (id === 'sess-qq' ? record : undefined) }),
+      createSender(sent),
+      createLogger(),
+    );
+    const { handler } = installAndCapture(ch, sent);
+
+    const p = handler(makeRequest({ id: 'sess-qq' }), () => Promise.resolve('unavailable' as ApprovalOutcome));
+    await sleep(20);
+    expect(sent).toHaveLength(1);
+
+    // 他人点击 allow：ack 成功（消费事件）但不结算，并回一条提示
+    expect(ch.handleInteraction(
+      makeEvent(JSON.stringify({ t: 'approval', d: 'allow' }), { user: 'attacker', group: 'G1' }),
+    )).toBe(true);
+    await sleep(20);
+    expect(sent).toHaveLength(2);
+    expect(sent[1]!.text).toContain('只有发起人可以确认');
+    expect(await Promise.race([p, sleep(30).then(() => 'pending')])).toBe('pending');
+
+    // 发起人点击：正常结算
+    expect(ch.handleInteraction(
+      makeEvent(JSON.stringify({ t: 'approval', d: 'allow' }), { user: 'owner', group: 'G1' }),
+    )).toBe(true);
+    await expect(p).resolves.toBe('allowed-once');
   });
 });
 

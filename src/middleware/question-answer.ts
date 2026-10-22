@@ -15,7 +15,12 @@ export function questionAnswer(manager: SessionManager) {
       await next();
       return;
     }
-    if (questionChannel.tryAnswer(ctx.replyTarget.scope, ctx.replyTarget.targetId, ctx.message.content.trim())) {
+    if (questionChannel.tryAnswer(
+      ctx.replyTarget.scope,
+      ctx.replyTarget.targetId,
+      ctx.message.senderId,
+      ctx.message.content.trim(),
+    )) {
       // 答案消息被截获（不再走到 bot.on('message')），在此补录其 msgId，
       // 供被动回复超限时切换到缓存的最近 msgId。
       cacheMsgId(ctx.replyTarget.scope, ctx.replyTarget.targetId, ctx.replyTarget.msgId);

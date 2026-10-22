@@ -13,7 +13,7 @@ import type { InlineKeyboard, InteractionEvent } from '@tencent-connect/qqbot-no
 import type { ChatScope, Logger, ReplyTarget } from '../types.ts';
 import { parseAnswer } from './answer-parser.ts';
 import { buildKeyboard, formatQuestion } from './question-renderer.ts';
-import { decodeButtonData } from './button-utils.ts';
+import { decodeButtonData, interactionClickerIds } from './button-utils.ts';
 
 // ── 最小契约（对齐 dsh-user-questions，避免硬依赖） ──
 
@@ -57,6 +57,8 @@ export interface QuestionSessionRecordLike {
   sessionKey: string;
   scope: ChatScope;
   replyTarget: ReplyTarget;
+  /** 发起当前指令的用户 openid：只有他能作答 */
+  senderId: string;
 }
 
 export interface QuestionChannelManagerLike {
@@ -93,6 +95,8 @@ class QuestionChannelError extends Error {
 interface PendingEntry {
   record: QuestionSessionRecordLike;
   request: UserQuestionRequest;
+  /** 谁发起的这条指令（= askViaQQ 时该会话记录上的 senderId） */
+  requesterId: string;
   resolve: (result: UserQuestionResult) => void;
   reject: (err: Error) => void;
   onAbort?: () => void;
@@ -175,13 +179,18 @@ export class QuestionChannel {
   }
 
   /** 入站文本作答：该会话若有待答问题且本条消息有文本，解析为答案并推进 */
-  public tryAnswer(scope: ChatScope, peerId: string, text: string): boolean {
+  public tryAnswer(scope: ChatScope, peerId: string, senderId: string, text: string): boolean {
     const record = this.manager.getSessionRecord(scope, peerId);
     if (!record) return false;
     const key = record.sessionKey;
     const entry = this.pending.get(key);
     if (!entry) return false;
     if (!text) return false; // 纯图片/表情等：继续等待，消息走常规流程
+    // 他人消息不当作答案：返回 false 让它走常规流程，避免群成员代人作答
+    if (senderId !== entry.requesterId) {
+      this.logger.info(`im-qqbot: question answer ignored (not requester) key=${key}`);
+      return false;
+    }
 
     const current = entry.request.questions[entry.index];
     if (!current) return false;
@@ -204,6 +213,12 @@ export class QuestionChannel {
     if (!data) return false;
     const button = decodeButtonData(data);
     if (!button || button.t !== 'question') return false;
+    // 同上：群成员点击他人问题的按钮，只提示、不推进状态机
+    const clickers = interactionClickerIds(event);
+    if (clickers.length > 0 && !clickers.includes(entry.requesterId)) {
+      this.notifyNotRequester(entry);
+      return true;
+    }
     const current = entry.request.questions[entry.index];
     if (!current) return false;
     // 校验按钮归属题：旧题按钮在新题推进后被点击（误点/延迟事件），
@@ -239,7 +254,9 @@ export class QuestionChannel {
     await this.sendQuestion(record, first);
 
     return new Promise<UserQuestionResult>((resolve, reject) => {
-      const entry: PendingEntry = { record, request, resolve, reject, index: 0, collected: [] };
+      const entry: PendingEntry = {
+        record, request, requesterId: record.senderId, resolve, reject, index: 0, collected: [],
+      };
       if (request.signal) {
         const onAbort = (): void => {
           if (this.pending.get(key) !== entry) return;
@@ -319,6 +336,16 @@ export class QuestionChannel {
   private clearTimer(entry: PendingEntry): void {
     if (entry.timer) clearTimeout(entry.timer);
     entry.timer = undefined;
+  }
+
+  /** 非发起人点击：提示但不推进状态机（问题仍挂起等待发起人） */
+  private notifyNotRequester(entry: PendingEntry): void {
+    const text = '⚠️ 这次提问由他人发起，只有发起人可以作答。';
+    void this.sender.sendMarkdown(entry.record.replyTarget, text).catch((err: unknown) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.logger.warn(`im-qqbot: notify not-requester failed key=${entry.record.sessionKey}: ${msg}`);
+    });
+    this.logger.info(`im-qqbot: question click rejected (not requester) key=${entry.record.sessionKey}`);
   }
 
   private removeAbort(entry: PendingEntry): void {

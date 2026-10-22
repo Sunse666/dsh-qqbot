@@ -473,6 +473,10 @@ export class SessionManager {
 
     if (existing) {
       existing.replyTarget = replyTarget;
+      // senderId 语义 = 最近一次投递消息的发送者（首次建立会话时即创建者）。
+      // 群聊共用一条会话记录，审批/问答要靠它判断「当前这条指令是谁发起的」；
+      // 不随消息更新，决策权就永远停在第一个发言的人身上。
+      existing.senderId = senderId;
       existing.lastActivity = Date.now();
       return existing;
     }

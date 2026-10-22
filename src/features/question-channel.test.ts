@@ -31,8 +31,17 @@ function createSender(sent: SentMessage[], opts?: { failKeyboard?: boolean }) {
 
 const sessionKey = (scope: ChatScope, peerId: string): string => `qqbot:app:${scope}:${peerId}`;
 
-function makeRecord(sessionKeyStr: string, scope: ChatScope = 'c2c'): QuestionSessionRecordLike {
-  return { sessionKey: sessionKeyStr, scope, replyTarget: { scope, targetId: 'x', msgId: 'm' } };
+function makeRecord(
+  sessionKeyStr: string,
+  scope: ChatScope = 'c2c',
+  senderId?: string,
+): QuestionSessionRecordLike {
+  return {
+    sessionKey: sessionKeyStr,
+    scope,
+    replyTarget: { scope, targetId: 'x', msgId: 'm' },
+    senderId: senderId ?? (sessionKeyStr.split(':').pop() ?? 'U1'),
+  };
 }
 
 function createManager(opts?: {
@@ -52,10 +61,11 @@ function startAsk(
   peerId: string,
   questions: UserQuestion[],
   signal?: AbortSignal,
+  requesterId: string = peerId,
 ): Promise<UserQuestionResult> {
   const key = sessionKey(scope, peerId);
   const request: UserQuestionRequest = { questions, ...(signal ? { signal } : {}) };
-  return ch.askViaQQ(makeRecord(key, scope), request);
+  return ch.askViaQQ(makeRecord(key, scope, requesterId), request);
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
@@ -152,7 +162,7 @@ describe('QuestionChannel.tryAnswer', () => {
     const ch = new QuestionChannel(createManager(), createSender(sent), { requireMention: false, askTimeoutMs: 60_000 }, createLogger());
     const p = startAsk(ch, 'c2c', 'U1', [q2()]);
     await sleep(20);
-    expect(ch.tryAnswer('c2c', 'U1', '2')).toBe(true);
+    expect(ch.tryAnswer('c2c', 'U1', 'U1', '2')).toBe(true);
     expect(await p).toEqual({ answers: [{ id: 'q', selected: ['B'] }] });
   });
 
@@ -166,24 +176,24 @@ describe('QuestionChannel.tryAnswer', () => {
     expect(sent).toHaveLength(1);
     expect(sent[0]!.text).toContain('问题1');
 
-    expect(ch.tryAnswer('c2c', 'U1', '1')).toBe(true);
+    expect(ch.tryAnswer('c2c', 'U1', 'U1', '1')).toBe(true);
     await sleep(20);
     expect(sent).toHaveLength(2);
     expect(sent[1]!.text).toContain('问题2');
 
-    expect(ch.tryAnswer('c2c', 'U1', '2')).toBe(true);
+    expect(ch.tryAnswer('c2c', 'U1', 'U1', '2')).toBe(true);
     expect(await p).toEqual({ answers: [{ id: 'a', selected: ['A1'] }, { id: 'b', selected: ['B2'] }] });
   });
 
   it('ignores empty text and returns false when no pending question', async () => {
     const sent: SentMessage[] = [];
     const ch = new QuestionChannel(createManager(), createSender(sent), { requireMention: false, askTimeoutMs: 60_000 }, createLogger());
-    expect(ch.tryAnswer('c2c', 'nobody', '1')).toBe(false);
+    expect(ch.tryAnswer('c2c', 'nobody', 'nobody', '1')).toBe(false);
 
     const p = startAsk(ch, 'c2c', 'U1', [q2()]);
     await sleep(20);
-    expect(ch.tryAnswer('c2c', 'U1', '')).toBe(false);
-    ch.tryAnswer('c2c', 'U1', '1');
+    expect(ch.tryAnswer('c2c', 'U1', 'U1', '')).toBe(false);
+    ch.tryAnswer('c2c', 'U1', 'U1', '1');
     await p;
   });
 });
@@ -196,7 +206,7 @@ describe('QuestionChannel.askViaQQ', () => {
     await sleep(20);
     expect(sent[0]?.opts?.keyboard).toBeDefined();
     expect(sent[0]?.text).toContain('点击下方按钮选择');
-    ch.tryAnswer('c2c', 'U1', '1');
+    ch.tryAnswer('c2c', 'U1', 'U1', '1');
     await p;
   });
 
@@ -208,7 +218,7 @@ describe('QuestionChannel.askViaQQ', () => {
     expect(sent).toHaveLength(1);
     expect(sent[0]?.opts).toBeUndefined();
     expect(sent[0]?.text).toContain('回复编号选择');
-    ch.tryAnswer('c2c', 'U1', '1');
+    ch.tryAnswer('c2c', 'U1', 'U1', '1');
     await p;
   });
 
@@ -242,7 +252,7 @@ describe('QuestionChannel.askViaQQ', () => {
     const p2 = startAsk(ch, 'c2c', 'U1', [q2()]);
     await sleep(20);
     await expect(p1).rejects.toThrow('superseded');
-    ch.tryAnswer('c2c', 'U1', '1');
+    ch.tryAnswer('c2c', 'U1', 'U1', '1');
     await p2;
   });
 
@@ -281,10 +291,28 @@ describe('QuestionChannel.handleInteraction', () => {
   it('routes group clicks by group_openid', async () => {
     const sent: SentMessage[] = [];
     const ch = new QuestionChannel(createManager(), createSender(sent), { requireMention: false, askTimeoutMs: 60_000 }, createLogger());
-    const p = startAsk(ch, 'group', 'G1', [q2()]);
+    const p = startAsk(ch, 'group', 'G1', [q2()], undefined, 'member-a');
     await sleep(20);
-    expect(ch.handleInteraction(makeEvent(JSON.stringify({ t: 'question', q: 'q', i: 0 }), { user: 'someone', group: 'G1' }))).toBe(true);
+    expect(ch.handleInteraction(makeEvent(JSON.stringify({ t: 'question', q: 'q', i: 0 }), { user: 'member-a', group: 'G1' }))).toBe(true);
     expect(await p).toEqual({ answers: [{ id: 'q', selected: ['A'] }] });
+  });
+
+  it('ignores group clicks and text from members who did not ask', async () => {
+    const sent: SentMessage[] = [];
+    const ch = new QuestionChannel(createManager(), createSender(sent), { requireMention: false, askTimeoutMs: 60_000 }, createLogger());
+    const p = startAsk(ch, 'group', 'G1', [q2()], undefined, 'member-a');
+    await sleep(20);
+
+    // 他人点按钮：ack 但不推进，并回提示
+    expect(ch.handleInteraction(makeEvent(JSON.stringify({ t: 'question', q: 'q', i: 0 }), { user: 'member-b', group: 'G1' }))).toBe(true);
+    await sleep(20);
+    expect(sent.some((s) => s.text.includes('只有发起人可以作答'))).toBe(true);
+    // 他人发文本：不当作答案，走常规流程
+    expect(ch.tryAnswer('group', 'G1', 'member-b', '2')).toBe(false);
+
+    // 发起人作答：正常推进
+    expect(ch.tryAnswer('group', 'G1', 'member-a', '2')).toBe(true);
+    expect(await p).toEqual({ answers: [{ id: 'q', selected: ['B'] }] });
   });
 
   it('resolves with the full original label for truncated buttons', async () => {
@@ -306,9 +334,11 @@ describe('QuestionChannel.handleInteraction', () => {
     expect(ch.handleInteraction(makeEvent(JSON.stringify({ t: 'question', q: 'q', i: 9 }), { user: 'U2' }))).toBe(false);
     // 旧题按钮：q 不等于当前题 id，忽略
     expect(ch.handleInteraction(makeEvent(JSON.stringify({ t: 'question', q: 'other', i: 0 }), { user: 'U2' }))).toBe(false);
+    // 私聊里换个人点击 = 另一个会话 key，落不到这条 pending 上 → false
+    // （群聊场景的他人点击见「ignores group clicks and text from members who did not ask」）
     expect(ch.handleInteraction(makeEvent(JSON.stringify({ t: 'question', q: 'q', i: 0 }), { user: 'nobody' }))).toBe(false);
     expect(ch.handleInteraction(makeEvent(undefined, { user: 'U2' }))).toBe(false);
-    ch.tryAnswer('c2c', 'U2', '1');
+    ch.tryAnswer('c2c', 'U2', 'U2', '1');
     await p;
   });
 
@@ -358,7 +388,7 @@ describe('QuestionChannel.install routing', () => {
 
     const p = uq.ask({ questions: [q2()], agent: { id: 'sess-qq' } });
     await new Promise((r) => setTimeout(r, 10));
-    expect(ch.tryAnswer('c2c', 'u9', '1')).toBe(true);
+    expect(ch.tryAnswer('c2c', 'u9', 'u9', '1')).toBe(true);
     expect(await p).toEqual({ answers: [{ id: 'q', selected: ['A'] }] });
     expect(origCalled).toBe(1); // QQ 路径未触碰原实现
   });
