@@ -193,7 +193,7 @@ export class SessionManager {
    * 读不到（服务缺失 / session 不存在 / 未记录 agentPreset）返回 undefined。
    */
   private async resolvePersistedPreset(sessionId: string): Promise<string | undefined> {
-    return (await this.host.sessionHeader(sessionId))?.meta?.agentPreset;
+    return (await this.host.sessionHeader(sessionId))?.agentPreset;
   }
 
   // ── 模型相关（委托给 ModelResolver） ──
@@ -596,9 +596,9 @@ export class SessionManager {
   /**
    * resume 失败后是否允许首次创建。
    *
-   * 只有确认会话不存在才可创建：损坏/占用/后端故障沿用同一 id 重建，会把同一
-   * sessionId 写进多个 project 目录，宿主 `list()` 随后报 duplicate，会话列表
-   * 整体打不开（对齐宿主 `restoreOrCreateConfigured` 的 fail-loud 语义）。
+   * 只有「会话确实不在盘上」才可创建：损坏/占用/后端故障沿用同一 id 重建，会把
+   * 同一 sessionId 写进多个 project 目录，宿主 `list()` 随后报 duplicate，会话
+   * 列表整体打不开（对齐宿主 `restoreOrCreateConfigured` 的 fail-loud 语义）。
    *
    * @returns 允许创建返回 true；拒绝时已记录 warn，调用方应抛出原 resume 错误。
    */
@@ -608,7 +608,7 @@ export class SessionManager {
     try {
       exists = await this.host.sessionExists(sessionId);
     } catch (probeError) {
-      // 求证本身失败（后端故障）：无法断言不存在，按存在处理
+      // 求证本身失败（持久化后端故障）：无法断言不在盘上，按存在处理
       this.logger.warn(`refusing to recreate session, existence unknown: ${context} probeErr=${errorText(probeError)}`);
       return false;
     }
@@ -617,8 +617,8 @@ export class SessionManager {
       return false;
     }
     if (exists === undefined) {
-      // 旧宿主无 persistence 服务，没有求证手段：仅按 resume 结果创建
-      this.logger.warn(`creating session without existence check (host lacks sessionPersistence): ${context}`);
+      // 宿主无 sessionPersistence.stat：没有求证手段，只能按 resume 结果创建（= 修复前行为）
+      this.logger.warn(`creating session without existence check (host lacks sessionPersistence.stat): ${context}`);
     }
     return true;
   }

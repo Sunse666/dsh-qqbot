@@ -68,41 +68,48 @@ describe('host adapter', () => {
     expect(await adapter.buildForkSeed([{ seq: 0 }], 0)).toBeUndefined();
   });
 
-  it('sessionHeader：读到 header 返回之，load 失败返回 undefined（不抛）', async () => {
-    const header = { meta: { agentPreset: 'coder' } };
-    const ok = createHostAdapter(makeCtx({ sessionPersistence: { load: async () => header } }));
-    expect(await ok.sessionHeader('s1')).toBe(header);
+  it('sessionHeader：取 stat().header（agentPreset 在 header 顶层）', async () => {
+    const header = { id: 's1', agentPreset: 'coder' };
+    const adapter = createHostAdapter(makeCtx({ sessionPersistence: { stat: async () => ({ header }) } }));
+    expect(await adapter.sessionHeader('s1')).toBe(header);
+  });
+
+  it('sessionHeader：会话不存在（stat → undefined）或读取失败均返回 undefined（不抛）', async () => {
+    const absent = createHostAdapter(makeCtx({ sessionPersistence: { stat: async () => undefined } }));
+    expect(await absent.sessionHeader('s1')).toBeUndefined();
 
     const failing = createHostAdapter(makeCtx({
-      sessionPersistence: { load: async () => { throw new Error('EIO'); } },
+      sessionPersistence: { stat: async () => { throw new Error('EIO'); } },
     }));
     expect(await failing.sessionHeader('s1')).toBeUndefined();
   });
 
-  it('sessionExists：load 成功 → true', async () => {
-    const adapter = createHostAdapter(makeCtx({ sessionPersistence: { load: async () => ({}) } }));
-    expect(await adapter.sessionExists('s1')).toBe(true);
+  it('sessionExists：stat 返回快照 → true，返回 undefined → false', async () => {
+    const present = createHostAdapter(makeCtx({ sessionPersistence: { stat: async () => ({ header: { id: 's1' } }) } }));
+    expect(await present.sessionExists('s1')).toBe(true);
+
+    const absent = createHostAdapter(makeCtx({ sessionPersistence: { stat: async () => undefined } }));
+    expect(await absent.sessionExists('s1')).toBe(false);
   });
 
-  it('sessionExists：宿主 NotFound 错误 → false', async () => {
-    const notFound = Object.assign(new Error('session "s1" not found'), { name: 'SessionPersistenceNotFoundError' });
+  it('sessionExists：后端故障照常抛出（求证失败 ≠ 不存在）', async () => {
     const adapter = createHostAdapter(makeCtx({
-      sessionPersistence: { load: async () => { throw notFound; } },
+      sessionPersistence: { stat: async () => { throw new Error('EIO: backend unavailable'); } },
     }));
-    expect(await adapter.sessionExists('s1')).toBe(false);
+    await expect(adapter.sessionExists('s1')).rejects.toThrow(/EIO/);
   });
 
-  it('sessionExists：非 NotFound 失败 → 抛出（求证失败 ≠ 不存在）', async () => {
-    // 文案含 not found 但 name 不是宿主 NotFound：如 preset/工具缺失，不得判为会话不存在
-    const adapter = createHostAdapter(makeCtx({
-      sessionPersistence: { load: async () => { throw new Error('tool "x" not found'); } },
-    }));
-    await expect(adapter.sessionExists('s1')).rejects.toThrow(/tool "x" not found/);
-  });
-
-  it('sessionExists：旧宿主无 sessionPersistence → undefined', async () => {
+  it('sessionExists：服务未注册 → undefined', async () => {
     const adapter = createHostAdapter(makeCtx({}));
     expect(await adapter.sessionExists('s1')).toBeUndefined();
-    expect(adapter.capabilities).toContain('sessionPersistence(缺失，会话存在性判定降级)');
+    expect(adapter.capabilities).toContain('sessionPersistence.stat(不可用，会话存在性判定降级)');
+  });
+
+  it('sessionExists：服务形态不含 stat → undefined，不让 TypeError 冒出', async () => {
+    // 回归：此前按不存在的 load() 调用，TypeError 被当成「后端故障」，
+    // 全新会话被误判为「可能存在」而拒绝创建，用户侧表现为处理消息异常
+    const adapter = createHostAdapter(makeCtx({ sessionPersistence: { open: async () => ({}) } }));
+    expect(await adapter.sessionExists('s1')).toBeUndefined();
+    expect(await adapter.sessionHeader('s1')).toBeUndefined();
   });
 });

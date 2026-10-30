@@ -32,16 +32,22 @@ const LEGACY_ID = legacyDerivedSessionId(KEY);
 const MINTED = /^session-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const REPLY: ReplyTarget = { scope: 'c2c', targetId: PEER, msgId: 'm1' };
 
-/** 宿主 persistence 对不存在 id 的报错（name 是插件唯一认的判据） */
+/** agents.resume 对不存在会话的报错 */
 const notFound = (id: string): Error =>
   Object.assign(new Error(`session "${id}" not found`), { name: 'SessionPersistenceNotFoundError' });
 /** 非「不存在」类失败：日志损坏 / 后端 IO / 同 id 未释放等 */
 const corrupt = (id: string): Error => new Error(`EIO: corrupt session log for "${id}"`);
 
-/** 宿主 persistence 替身：按 id 决定 load 成功还是报不存在 */
-function persistenceCtx(load: (id: string) => Promise<unknown>): Context {
+/**
+ * 宿主 persistence 替身。
+ *
+ * 签名对齐宿主 `SessionPersistence.stat`：会话不存在返回 `undefined`（不抛），
+ * 存在则返回快照。替身必须跟真实契约一致——此前替身带了宿主根本没有的
+ * `load()`，用例全绿但线上直接 TypeError。
+ */
+function persistenceCtx(stat: (id: string) => Promise<{ header?: { agentPreset?: string } } | undefined>): Context {
   return {
-    get: (name: string) => (name === 'sessionPersistence' ? { load } : undefined),
+    get: (name: string) => (name === 'sessionPersistence' ? { stat } : undefined),
     on: vi.fn(),
   } as unknown as Context;
 }
@@ -106,14 +112,19 @@ function allLogText(logger: Logger): string {
 
 const managers: Array<InstanceType<typeof SessionManager>> = [];
 
-/** 无任何宿主服务的 ctx（旧宿主：无 sessionPersistence，存在性无法求证） */
+/** 无任何宿主服务的 ctx（无 sessionPersistence，存在性无法求证） */
 function emptyCtx(): Context {
   return { get: () => undefined, on: vi.fn() } as unknown as Context;
 }
 
-/** 现代宿主默认替身：磁盘上没有任何会话（load 一律报不存在） */
+/** 默认替身：磁盘上没有任何会话（stat 一律 undefined） */
 function absentCtx(): Context {
-  return persistenceCtx(async (id) => { throw notFound(id); });
+  return persistenceCtx(async () => undefined);
+}
+
+/** 替身：指定 id 的会话在盘上 */
+function onDiskCtx(...ids: string[]): Context {
+  return persistenceCtx(async (id) => (ids.includes(id) ? { header: {} } : undefined));
 }
 
 function createManagerWithCtx(
@@ -189,6 +200,33 @@ describe('getOrCreate — 对照组（迁移主路径行为正确）', () => {
     expect(registry.resume).toHaveBeenCalledTimes(1);
     expect(registry.create).not.toHaveBeenCalled();
   });
+
+  it('session 当初的 preset 锁定：优先 header.agentPreset，而非当前 effective preset', async () => {
+    const prefs = new PrefsStore();
+    prefs.setSessionId(KEY, 'session-current');
+    prefs.setPreset(KEY, 'current-preset'); // 当前 effective 已被 /preset 换过
+    const { registry } = createRegistry(async ({ resumeSessionId }) => fakeHandle(resumeSessionId));
+    const presets = {
+      resolve: vi.fn(async (id?: string) => ({ id: id ?? 'default' })),
+      mount: vi.fn(async () => {}),
+      list: vi.fn(async () => []),
+    };
+    const ctx = {
+      get: (name: string) => {
+        if (name === 'sessionPersistence') {
+          return { stat: async (id: string) => (id === 'session-current' ? { header: { agentPreset: 'locked-preset' } } : undefined) };
+        }
+        return name === 'agentPresets' ? presets : undefined;
+      },
+      on: vi.fn(),
+    } as unknown as Context;
+
+    const record = await createManagerWithCtx(registry, ctx).getOrCreate('c2c', PEER, PEER, REPLY);
+
+    // 此前 header 读取一直失败（调用了宿主没有的 load），preset 锁定语义实际失效
+    expect(presets.resolve).toHaveBeenCalledWith('locked-preset');
+    expect(record.agentPreset).toBe('locked-preset');
+  });
 });
 
 describe('getOrCreate — E1 resume 失败按会话是否存在分流', () => {
@@ -197,7 +235,7 @@ describe('getOrCreate — E1 resume 失败按会话是否存在分流', () => {
     const { registry } = createRegistry(async ({ resumeSessionId }) => { throw corrupt(resumeSessionId); });
     const logger = createLogger();
     // 宿主自身（agent-loop restoreOrCreateConfigured）只在确认磁盘不存在时才 create
-    const manager = createManagerWithCtx(registry, persistenceCtx(async () => ({})), logger);
+    const manager = createManagerWithCtx(registry, onDiskCtx('session-current'), logger);
 
     await expect(manager.getOrCreate('c2c', PEER, PEER, REPLY)).rejects.toThrow(/EIO/);
 
@@ -208,13 +246,9 @@ describe('getOrCreate — E1 resume 失败按会话是否存在分流', () => {
 
   it('E1-2 0.5.x 老会话在盘上但 resume 遇瞬时错误 → 不弃用，故障恢复后仍能恢复', async () => {
     const first = createRegistry(async ({ resumeSessionId }) => { throw corrupt(resumeSessionId); });
-    const onDisk = persistenceCtx(async (id) => {
-      if (id === LEGACY_ID) return {}; // 老会话确实在盘上
-      throw notFound(id);
-    });
 
     await expect(
-      createManagerWithCtx(first.registry, onDisk).getOrCreate('c2c', PEER, PEER, REPLY),
+      createManagerWithCtx(first.registry, onDiskCtx(LEGACY_ID)).getOrCreate('c2c', PEER, PEER, REPLY),
     ).rejects.toThrow(/EIO/);
     expect(first.registry.create).not.toHaveBeenCalled();
     expect(persistedId()).toBeUndefined();
@@ -230,7 +264,7 @@ describe('getOrCreate — E1 resume 失败按会话是否存在分流', () => {
     expect(persistedId()).toBe(LEGACY_ID);
   });
 
-  it('E1-3 存在性求证本身失败（后端故障）→ 按存在处理，不重建', async () => {
+  it('E1-3 存在性求证本身失败（持久化后端故障）→ 按存在处理，不重建', async () => {
     new PrefsStore().setSessionId(KEY, 'session-current');
     const { registry } = createRegistry(async ({ resumeSessionId }) => { throw notFound(resumeSessionId); });
     const logger = createLogger();
@@ -252,14 +286,30 @@ describe('getOrCreate — E1 resume 失败按会话是否存在分流', () => {
     expect(createdIds(registry)).toEqual([record.sessionId]);
   });
 
-  it('E1-5 旧宿主无 sessionPersistence → 无求证手段，按 resume 结果创建并留痕', async () => {
+  it('E1-5 宿主无 sessionPersistence.stat → 无求证手段，按 resume 结果创建并留痕', async () => {
     const { registry } = createRegistry(async ({ resumeSessionId }) => { throw notFound(resumeSessionId); });
     const logger = createLogger();
 
     const record = await createManagerWithCtx(registry, emptyCtx(), logger).getOrCreate('c2c', PEER, PEER, REPLY);
 
     expect(record.sessionId).toMatch(MINTED);
-    expect(allLogText(logger)).toContain('host lacks sessionPersistence');
+    expect(createdIds(registry)).toEqual([record.sessionId]);
+    expect(allLogText(logger)).toContain('host lacks sessionPersistence.stat');
+  });
+
+  it('E1-6 宿主 persistence 形态不含 stat → 不卡住全新会话的创建', async () => {
+    // 回归：此前按不存在的 load() 求证，TypeError 被当成「后端故障」→ 拒绝创建，
+    // 全新用户的第一条消息直接收到「处理消息时出现异常」
+    const { registry } = createRegistry(async ({ resumeSessionId }) => { throw notFound(resumeSessionId); });
+    const legacyShape = {
+      get: (name: string) => (name === 'sessionPersistence' ? { open: async () => ({}) } : undefined),
+      on: vi.fn(),
+    } as unknown as Context;
+
+    const record = await createManagerWithCtx(registry, legacyShape).getOrCreate('c2c', PEER, PEER, REPLY);
+
+    expect(record.sessionId).toMatch(MINTED);
+    expect(createdIds(registry)).toEqual([record.sessionId]);
   });
 });
 
@@ -308,7 +358,7 @@ describe('getOrCreate — E2 确定性 id 不进入新建路径', () => {
     new PrefsStore().setSessionId(KEY, 'session-current');
     const { registry } = createRegistry(async ({ resumeSessionId }) => { throw corrupt(resumeSessionId); });
     // 会话在盘上 → resume 失败不重建，整次调用以失败告终
-    const manager = createManagerWithCtx(registry, persistenceCtx(async () => ({})));
+    const manager = createManagerWithCtx(registry, onDiskCtx('session-current'));
 
     const first = manager.getOrCreate('c2c', PEER, PEER, REPLY);
     const second = manager.getOrCreate('c2c', PEER, PEER, REPLY);

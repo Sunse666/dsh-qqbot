@@ -22,41 +22,46 @@ export interface HostAdapter {
   globalService(name: string): unknown | undefined;
   /** 官方 fork seed 构造；旧宿主无导出时返回 undefined */
   buildForkSeed(events: readonly unknown[], boundary: number): Promise<readonly unknown[] | undefined>;
-  /** 会话 header 读取（取 meta.agentPreset 等）；服务缺失或读取失败返回 undefined */
+  /** 会话 header 读取（取 agentPreset 等）；会话不存在、服务缺失或读取失败返回 undefined */
   sessionHeader(sessionId: string): Promise<SessionHeaderLike | undefined>;
   /**
    * 会话是否存在于持久化层。
    *
-   * 三种结果语义不同，调用方必须区分——把「判不出」当成「不存在」正是重建已存在
-   * 会话、撞出重复 id 的根因：
-   * - `true` / `false`：确定答案；
-   * - `undefined`：旧宿主无该服务，没有求证手段；
-   * - 抛出：求证过程本身失败（后端故障），不能据此断言会话不存在。
+   * `undefined` = 没有求证手段（宿主未注册 sessionPersistence，或其形态不含
+   * `stat`）。调用方不得把它当成「不存在」——那正是重建已存在会话、撞出重复
+   * id 的根因。后端真故障时照常抛出。
    */
   sessionExists(sessionId: string): Promise<boolean | undefined>;
   /** 探测结果摘要（启动契约检查用） */
   readonly capabilities: string[];
 }
 
-/** 会话持久化 header 的最小结构（只读插件关心的字段） */
+/** 会话 header 的最小结构（只读插件关心的字段；`agentPreset` 在 header 顶层） */
 export interface SessionHeaderLike {
-  meta?: { agentPreset?: string };
-}
-
-/** 持久化服务的最小只读契约 */
-interface SessionPersistenceLike {
-  load(id: string): Promise<SessionHeaderLike>;
+  agentPreset?: string;
 }
 
 /**
- * 宿主「会话不存在」错误的稳定 name。
+ * 持久化服务的最小只读契约。
  *
- * 不 import `SessionPersistenceNotFoundError`：该类属 session-persistence 包
- * （插件未直接依赖），且跨 realm 的 instanceof 不可靠。只认 name，不做文案
- * 猜测——resume/load 的报错可能来自别的环节（preset 挂载、同 id 未释放），
- * 把它们误判成「会话不存在」会导致重建一个实际存在的会话。
+ * 只用 `stat`：它不读事件日志、不取写所有权，且**会话不存在时返回 `undefined`
+ * 而非抛错**，正好是存在性判定需要的语义。不用 `open`（会争写所有权）、不用
+ * `list`（全量扫描）。
  */
-const NOT_FOUND_NAME = 'SessionPersistenceNotFoundError';
+interface SessionPersistenceLike {
+  stat(id: string): Promise<{ header?: SessionHeaderLike } | undefined>;
+}
+
+/**
+ * 取出可用的持久化服务；形态不匹配返回 undefined。
+ *
+ * 宿主服务是版本漂移点，必须探测方法是否存在再调用：直接调用缺失的方法会抛
+ * `TypeError`，与「后端故障」混在一起，让调用方误以为求证过了。
+ */
+function statCapablePersistence(ctx: Context): SessionPersistenceLike | undefined {
+  const persistence = safeGet(ctx, 'sessionPersistence') as SessionPersistenceLike | undefined;
+  return typeof persistence?.stat === 'function' ? persistence : undefined;
+}
 
 /** 模块级函数的动态 import 结果缓存（spec 变量路径绕开本地依赖类型检查） */
 const moduleCache = new Map<string, Record<string, unknown> | undefined>();
@@ -80,8 +85,10 @@ export function createHostAdapter(ctx: Context, logger?: AdapterLogger): HostAda
   // events 读取路径只有运行时才能确定，sessionEvents 内自适应
   capabilities.push('sessionEvents(s自适应)');
 
-  // persistence 可能在插件启动后才注册，sessionExists/sessionHeader 内每次取
-  capabilities.push(safeGet(ctx, 'sessionPersistence') ? 'sessionPersistence(已注册)' : 'sessionPersistence(缺失，会话存在性判定降级)');
+  // 可能在插件启动后才注册，sessionExists/sessionHeader 内每次重新探测；此处仅记录启动时形态
+  capabilities.push(statCapablePersistence(ctx)
+    ? 'sessionPersistence.stat(可用)'
+    : 'sessionPersistence.stat(不可用，会话存在性判定降级)');
 
   let resolveFn: ((agent: { ctx: unknown }, name: string) => unknown | undefined) | undefined;
   const presets = safeGet(ctx, 'agentPresets') as
@@ -127,25 +134,19 @@ export function createHostAdapter(ctx: Context, logger?: AdapterLogger): HostAda
     },
 
     async sessionHeader(sessionId) {
-      const persistence = safeGet(ctx, 'sessionPersistence') as SessionPersistenceLike | undefined;
+      const persistence = statCapablePersistence(ctx);
       if (!persistence) return undefined;
       try {
-        return await persistence.load(sessionId);
+        return (await persistence.stat(sessionId))?.header;
       } catch {
-        return undefined;
+        return undefined; // 读不到 preset 不该阻断会话打开，回落到当前 effective preset
       }
     },
 
     async sessionExists(sessionId) {
-      const persistence = safeGet(ctx, 'sessionPersistence') as SessionPersistenceLike | undefined;
+      const persistence = statCapablePersistence(ctx);
       if (!persistence) return undefined;
-      try {
-        await persistence.load(sessionId);
-        return true;
-      } catch (err) {
-        if ((err as { name?: unknown } | null)?.name === NOT_FOUND_NAME) return false;
-        throw err; // 求证失败 ≠ 会话不存在
-      }
+      return (await persistence.stat(sessionId)) !== undefined;
     },
 
     async buildForkSeed(events, boundary) {
