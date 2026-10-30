@@ -5,9 +5,10 @@
  *   - c2c:   peerId = senderId (用户 openid)
  *   - group: peerId = groupOpenid
  *
- * SessionId 由 sessionKey 确定性派生（SHA-256），
- * 保证同一个用户/群的消息始终路由到同一个会话，
- * 重启后可根据 key 恢复 session。
+ * sessionKey → sessionId 的映射存于 prefs（`model-prefs.json`），新会话 id 由
+ * `mintSessionId()` 铸造（`session-` + UUID，与宿主一致）。0.5.x 的 SHA-256 确定性
+ * 派生 id 仅用于探测存量会话并迁移，不再用于新建——确定性 id 跨进程必然相同，
+ * 两个进程各自新建会把同一 id 写入不同 project 目录。
  *
  * 支持 agent-presets 系统：通过 setup hook 在 create/resume 时
  * 挂载 preset（工具集、prompt sections 等），实现场景化配置。
@@ -92,6 +93,14 @@ export function latestCompletedPrefixBoundary(events: readonly unknown[]): numbe
 
 export class SessionManager {
   private sessions = new Map<string, SessionRecord>();
+  /**
+   * 同 key 正在进行的 getOrCreate（singleflight）。
+   *
+   * 斜杠命令与待答问题截获位于 concurrencyGuard 之前（见 gateway/middleware-setup），
+   * 与普通消息不串行：同 key 并发进入会各自 resume/create，产出两个 agent，
+   * 后写入 sessions 的覆盖前者且前者无人 dispose（泄漏）。
+   */
+  private inflight = new Map<string, Promise<SessionRecord>>();
   private readonly evictor: IdleEvictor;
   private readonly modelResolver: ModelResolver;
   private readonly ctx: Context;
@@ -184,19 +193,7 @@ export class SessionManager {
    * 读不到（服务缺失 / session 不存在 / 未记录 agentPreset）返回 undefined。
    */
   private async resolvePersistedPreset(sessionId: string): Promise<string | undefined> {
-    let persistence: { load(id: string): Promise<{ meta?: { agentPreset?: string } }> } | undefined;
-    try {
-      persistence = this.ctx.get('sessionPersistence') as typeof persistence | undefined;
-    } catch {
-      return undefined;
-    }
-    if (!persistence) return undefined;
-    try {
-      const { meta } = await persistence.load(sessionId);
-      return meta?.agentPreset;
-    } catch {
-      return undefined;
-    }
+    return (await this.host.sessionHeader(sessionId))?.meta?.agentPreset;
   }
 
   // ── 模型相关（委托给 ModelResolver） ──
@@ -485,7 +482,7 @@ export class SessionManager {
     }
   }
 
-  /** 获取或恢复或创建会话（get → resume → create） */
+  /** 获取或恢复或创建会话（get → resume → create）；同 key 并发合并为一次 */
   async getOrCreate(
     scope: ChatScope,
     peerId: string,
@@ -501,7 +498,35 @@ export class SessionManager {
       return existing;
     }
 
+    // singleflight：同 key 并发复用同一次 resume/create，后到者只更新回复目标
+    const pending = this.inflight.get(key);
+    if (pending) {
+      const shared = await pending;
+      shared.replyTarget = replyTarget;
+      shared.lastActivity = Date.now();
+      return shared;
+    }
+
+    const task = this.openSession(key, scope, peerId, senderId, replyTarget);
+    this.inflight.set(key, task);
+    try {
+      return await task;
+    } finally {
+      this.inflight.delete(key);
+    }
+  }
+
+  /** getOrCreate 的实际打开流程（已通过 singleflight 保证同 key 串行） */
+  private async openSession(
+    key: string,
+    scope: ChatScope,
+    peerId: string,
+    senderId: string,
+    replyTarget: ReplyTarget,
+  ): Promise<SessionRecord> {
     const route = this.modelResolver.getEffectiveRoute(key);
+    // prefs 命中 = 已知存量会话；miss 时取 0.5.x 派生 id 仅作存量探测候选，不用于新建
+    const candidateIsLegacy = this.modelResolver.getSessionId(key) === undefined;
     let sessionId = SessionId(this.currentSessionId(key));
     this.logger.info(`getOrCreate: key=${key} route=${route ? `${route.provider}/${route.model}` : 'host-default'} sessionId=${sessionId}`);
 
@@ -532,13 +557,9 @@ export class SessionManager {
         // 0.5.x 迁移：候选命中老会话，沿用并落盘
         this.persistSessionId(key, sessionId);
         this.logger.info(`resumed session: key=${key} preset=${agentPreset ?? 'none'} route=${resumeRoute ? `${resumeRoute.provider}/${resumeRoute.model}` : 'session-own'}`);
-      } catch {
-        // 无存量会话：弃用候选，铸造新 id
-        if (!this.modelResolver.getSessionId(key)) {
-          sessionId = SessionId(mintSessionId());
-          this.modelResolver.setSessionId(key, sessionId);
-          this.logger.info(`migrated to minted session id: key=${key} sessionId=${sessionId}`);
-        }
+      } catch (err) {
+        if (!(await this.mayCreateAfterResumeFailure(key, sessionId, err))) throw err;
+        sessionId = this.resolveCreateId(key, sessionId, candidateIsLegacy);
         const created = await this.agents.create({
           sessionId,
           meta: {
@@ -550,7 +571,8 @@ export class SessionManager {
         });
         agent = created.agent;
         handle = created;
-        this.logger.info(`created new session: key=${key} preset=${agentPreset ?? 'none'}`);
+        this.persistSessionId(key, sessionId);
+        this.logger.info(`created new session: key=${key} sessionId=${sessionId} preset=${agentPreset ?? 'none'}`);
       }
     }
 
@@ -569,6 +591,58 @@ export class SessionManager {
 
     this.sessions.set(key, record);
     return record;
+  }
+
+  /**
+   * resume 失败后是否允许首次创建。
+   *
+   * 只有确认会话不存在才可创建：损坏/占用/后端故障沿用同一 id 重建，会把同一
+   * sessionId 写进多个 project 目录，宿主 `list()` 随后报 duplicate，会话列表
+   * 整体打不开（对齐宿主 `restoreOrCreateConfigured` 的 fail-loud 语义）。
+   *
+   * @returns 允许创建返回 true；拒绝时已记录 warn，调用方应抛出原 resume 错误。
+   */
+  private async mayCreateAfterResumeFailure(key: string, sessionId: string, resumeError: unknown): Promise<boolean> {
+    const context = `key=${key} sessionId=${sessionId} resumeErr=${errorText(resumeError)}`;
+    let exists: boolean | undefined;
+    try {
+      exists = await this.host.sessionExists(sessionId);
+    } catch (probeError) {
+      // 求证本身失败（后端故障）：无法断言不存在，按存在处理
+      this.logger.warn(`refusing to recreate session, existence unknown: ${context} probeErr=${errorText(probeError)}`);
+      return false;
+    }
+    if (exists === true) {
+      this.logger.warn(`refusing to recreate existing session: ${context}`);
+      return false;
+    }
+    if (exists === undefined) {
+      // 旧宿主无 persistence 服务，没有求证手段：仅按 resume 结果创建
+      this.logger.warn(`creating session without existence check (host lacks sessionPersistence): ${context}`);
+    }
+    return true;
+  }
+
+  /**
+   * 确认候选会话缺失后决定用哪个 id 新建。
+   *
+   * - resume 等待期间 prefs 被并发改写（`/new` 换新会话）：采用 prefs 的最新 id，
+   *   否则内存与 prefs 指向不同会话，重启后用户被切走；
+   * - 候选来自 0.5.x 确定性派生：一律铸造新 id，确定性 id 不进入新建路径；
+   * - 候选来自 prefs 且确认缺失：沿用该 id 新建，prefs 无需改写。
+   */
+  private resolveCreateId(key: string, candidate: SessionId, candidateIsLegacy: boolean): SessionId {
+    const latest = this.modelResolver.getSessionId(key);
+    if (latest !== undefined && latest !== candidate) {
+      this.logger.info(`adopting concurrently written session id: key=${key} sessionId=${latest}`);
+      return SessionId(latest);
+    }
+    if (candidateIsLegacy) {
+      const minted = SessionId(mintSessionId());
+      this.logger.info(`migrated to minted session id: key=${key} sessionId=${minted}`);
+      return minted;
+    }
+    return candidate;
   }
 
   findBySessionId(sessionId: string): SessionRecord | undefined {
@@ -673,6 +747,11 @@ export class SessionManager {
   get size(): number {
     return this.sessions.size;
   }
+}
+
+/** 错误文案（日志用） */
+function errorText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
 }
 
 /** 从消息对象中提取纯文本（用于导出/统计） */

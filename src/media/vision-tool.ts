@@ -199,7 +199,9 @@ export function ensureVisionInputModal(vision: VisionConfig, logger: Logger): vo
     const before = readFileSync(settingsPath, 'utf8');
     const normalized = before.replace(/^\t+/gm, (tabs) => '  '.repeat(tabs.length));
 
-    const doc = parseDocument(normalized);
+    // intAsBigInt：整数不经 double 中转，避免回写时把用户其他配置里的大整数
+    // （安装 id、时间戳等）截断到 2^53 精度
+    const doc = parseDocument(normalized, { intAsBigInt: true });
     if (doc.errors.length > 0) throw new Error(`settings.yaml 解析失败: ${doc.errors[0]?.message ?? 'unknown'}`);
 
     const root = doc.contents;
