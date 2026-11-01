@@ -9,6 +9,7 @@
  */
 import type { EventOptions } from '@deepseek-ai/cordis';
 import type { InteractionEvent } from '@tencent-connect/qqbot-nodejs';
+import { randomUUID } from 'node:crypto';
 import type { ChatScope, Logger, ReplyTarget } from '../types.ts';
 import { decodeButtonData } from './button-utils.ts';
 import { buildApprovalKeyboard, buildApprovalText } from './approval-renderer.ts';
@@ -31,7 +32,7 @@ export interface ApprovalRequest {
      * 投影后的上下文，运行时拿不到 live session（类型契约与运行时的 gap）。此时
      * 只是无法回显命令原文，不应让整个审批失败，故这里标为可选。
      */
-    session?: { events?: ApprovalSessionEvent[] };
+    session?: { snapshotEvents?(): readonly ApprovalSessionEvent[] };
   };
   toolName: string;
   /** 关联的 tool/call 事件 id，用于从 session log 找回被 gate 的命令 */
@@ -58,6 +59,14 @@ export interface ApprovalChannelSenderLike {
   sendMarkdown(target: ReplyTarget, content: string, opts?: { keyboard?: unknown }): Promise<unknown>;
 }
 
+/** 配置投影（审批按钮校验 allowlist 用） */
+export interface ApprovalChannelConfigLike {
+  access: {
+    c2cMode: 'open' | 'allowlist' | 'disabled';
+    c2cAllow: readonly string[];
+  };
+}
+
 /** approval/request waterfall 的 answerer handler */
 export interface ApprovalChannelContext {
   on(
@@ -73,6 +82,8 @@ interface PendingApproval {
   record: ApprovalSessionRecordLike;
   request: ApprovalRequest;
   resolve: (outcome: ApprovalOutcome) => void;
+  /** 本审批的唯一标识，编码进按钮 data，点击时必须匹配（防旧卡片混淆） */
+  nonce: string;
   onAbort?: () => void;
 }
 
@@ -86,7 +97,7 @@ function commandOf(req: ApprovalRequest): string | undefined {
   if (req.callId === undefined) return undefined;
   // 审批请求可能来自没有 live session 的上下文（例如跨进程/投影后的 Agent），
   // 此时只是拿不到命令原文，不能因此让整个审批失败。
-  const events = req.agent.session?.events;
+  const events = req.agent.session?.snapshotEvents?.();
   if (!Array.isArray(events)) return undefined;
   for (let i = events.length - 1; i >= 0; i -= 1) {
     const event = events[i];
@@ -114,14 +125,17 @@ export class ApprovalChannel {
   private readonly manager: ApprovalChannelManagerLike;
   private readonly sender: ApprovalChannelSenderLike;
   private readonly logger: Logger;
+  private readonly config: ApprovalChannelConfigLike;
 
   public constructor(
     manager: ApprovalChannelManagerLike,
     sender: ApprovalChannelSenderLike,
+    config: ApprovalChannelConfigLike,
     logger: Logger,
   ) {
     this.manager = manager;
     this.sender = sender;
+    this.config = config;
     this.logger = logger;
   }
 
@@ -156,7 +170,7 @@ export class ApprovalChannel {
     entry.resolve('cancelled');
   }
 
-  /** 按钮点击决策：解码 button_data，settle pending 审批 */
+  /** 按钮点击决策：解码 button_data，校验点击者授权，settle pending 审批 */
   public handleInteraction(event: InteractionEvent): boolean {
     const peerId = event.group_openid ?? event.user_openid;
     if (!peerId) return false;
@@ -171,6 +185,20 @@ export class ApprovalChannel {
     const button = decodeButtonData(data);
     if (!button || button.t !== 'approval') return false;
 
+    // nonce 必须匹配 pending：旧卡片/其它会话的卡片点击不 settle（#94-3）
+    if (button.n !== entry.nonce) {
+      this.logger.warn(`im-qqbot: approval button nonce mismatch: key=${record.sessionKey}`);
+      return false;
+    }
+
+    // 白名单模式下审批只认名单内用户；点击者身份缺失同样拒绝（fail-closed，#94-3）
+    const clicker = event.group_member_openid ?? event.user_openid;
+    if (this.config.access.c2cMode === 'allowlist'
+      && (!clicker || !this.config.access.c2cAllow.includes(clicker))) {
+      this.logger.warn(`im-qqbot: approval button rejected (clicker not allowlisted): user=${clicker ?? '(missing)'} key=${record.sessionKey}`);
+      return false;
+    }
+
     this.pending.delete(record.sessionKey);
     this.removeAbort(entry);
     entry.resolve(button.d === 'allow' ? 'allowed-once' : 'rejected');
@@ -184,11 +212,12 @@ export class ApprovalChannel {
     if (request.signal?.aborted) return 'cancelled';
 
     const command = commandOf(request);
+    const nonce = randomUUID().slice(0, 8);
     try {
       await this.sender.sendMarkdown(
         record.replyTarget,
         buildApprovalText(request, command),
-        { keyboard: buildApprovalKeyboard() },
+        { keyboard: buildApprovalKeyboard(nonce) },
       );
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -197,7 +226,7 @@ export class ApprovalChannel {
     }
 
     return new Promise<ApprovalOutcome>((resolve) => {
-      const entry: PendingApproval = { record, request, resolve };
+      const entry: PendingApproval = { record, request, resolve, nonce };
       if (request.signal) {
         const onAbort = (): void => {
           if (this.pending.get(key) !== entry) return;
